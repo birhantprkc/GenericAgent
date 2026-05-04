@@ -66,6 +66,25 @@ def _last_summary(pairs):
 def _preview_text(pairs):
     return _last_summary(pairs) or _first_user(pairs)
 
+def _recent_context(my_pid, n=5):
+    """扫描最近 n 个 model_response 文件（排除自身），提取 lastQ / lastA。"""
+    out = []
+    for f in sorted(glob.glob(_LOG_GLOB), key=os.path.getmtime, reverse=True):
+        m = re.search(r'model_responses_(\d+)', os.path.basename(f))
+        if not m or m.group(1) == str(my_pid): continue
+        try: c = open(f, encoding='utf-8', errors='ignore').read()
+        except Exception: continue
+        q = s = ""
+        for hm in re.finditer(r'<history>(.*?)</history>', c, re.DOTALL):
+            u = re.search(r'\[USER\]:\s*(.+?)(?:\\n|<)', hm.group(1))
+            if u: q = u.group(1)
+        sm = _SUMMARY_RE.search(c)
+        if sm: s = sm.group(1).strip()
+        q, s = q[:60].strip(), s[:60].replace('\n', ' ').strip()
+        out.append(f'· {m.group(1)} | lastQ: {q or "-"} | lastA: {s or "-"}')
+        if len(out) >= n: break
+    return ('[RecentContext] 近期并行会话（非当前）:\n' + '\n'.join(out) + '\n[/RecentContext]') if out else ""
+
 def _parse_native_history(pairs):
     history = []
     for p, r in pairs:
@@ -212,6 +231,57 @@ def handle(agent, query, display_queue):
         display_queue.put({'done': msg, 'source': 'system'})
         return None
     return query
+
+
+def _user_text(prompt_body):
+    """User-typed text from a prompt JSON; '' if this is an agent auto-continuation."""
+    try: msg = json.loads(prompt_body)
+    except Exception: return ''
+    if not isinstance(msg, dict): return ''
+    for blk in msg.get('content', []) or []:
+        if isinstance(blk, dict) and blk.get('type') == 'text':
+            t = (blk.get('text') or '').strip()
+            if t and not t.startswith('### [WORKING MEMORY]'): return t
+    return ''
+
+
+def _assistant_text(response_body):
+    """Joined text from a response blocks repr; '' on parse failure."""
+    try: blocks = ast.literal_eval(response_body)
+    except Exception: return ''
+    if not isinstance(blocks, list): return ''
+    return '\n'.join(b['text'] for b in blocks
+                     if isinstance(b, dict) and b.get('type') == 'text'
+                     and isinstance(b.get('text'), str) and b['text'].strip())
+
+
+_TURN_MARK = '**LLM Running (Turn {}) ...**\n\n'
+
+
+def extract_ui_messages(path):
+    """Parse a model_responses log into [{role, content}, ...] for UI replay.
+
+    Auto-continuation turns are folded into one assistant bubble with Turn markers,
+    matching live chat rendering via fold_turns().
+    """
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f: content = f.read()
+    except Exception: return []
+
+    rounds = []  # [(user_text, [turn_text, ...]), ...]
+    for prompt, response in _pairs(content):
+        user = _user_text(prompt)
+        if user or not rounds: rounds.append((user, []))
+        rounds[-1][1].append(_assistant_text(response))
+
+    out = []
+    for user, turns in rounds:
+        if not user or not any(turns): continue
+        body = '\n\n'.join(t if i == 0 else _TURN_MARK.format(i + 1) + t
+                           for i, t in enumerate(turns))
+        out += [{'role': 'user', 'content': user},
+                {'role': 'assistant', 'content': body}]
+    return out
 
 
 def handle_frontend_command(agent, query, exclude_pid=None):
