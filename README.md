@@ -80,8 +80,9 @@ After a few weeks, your agent instance will have a skill tree no one else in the
 git clone https://github.com/lsdefine/GenericAgent.git
 cd GenericAgent
 
-# 2. Install minimal dependencies
-pip install requests streamlit pywebview
+# 2. Install dependencies
+pip install requests streamlit pywebview   # Desktop GUI (launch.pyw)
+pip install requests textual               # Terminal UI (tuiapp.py)
 
 # 3. Configure API Key
 cp mykey_template.py mykey.py
@@ -110,30 +111,24 @@ Full guide: [GETTING_STARTED.md](GETTING_STARTED.md)
 
 ---
 
-## 🤖 Bot Interface (Optional)
+## 🖥️ Desktop Frontends
 
-### Telegram Bot
+### Terminal UI
 
-```python
-# mykey.py
-tg_bot_token = 'YOUR_BOT_TOKEN'
-tg_allowed_users = [YOUR_USER_ID]
-```
+A lightweight, keyboard-driven interface built on [Textual](https://github.com/Textualize/textual). Supports multiple concurrent sessions, real-time streaming, and runs anywhere a terminal does — no browser needed.
 
 ```bash
-python frontends/tgapp.py
+python frontends/tuiapp.py
 ```
 
-### Alternative App Frontends
-
-Besides the default Streamlit web UI, you can also try other frontend styles:
+### Other Desktop Frontends
 
 ```bash
 python frontends/qtapp.py                # Qt-based desktop app
 streamlit run frontends/stapp2.py        # Alternative Streamlit UI
 ```
 
-### Codeg 
+### Codeg
 
 <table><tr>
 <td width="70%">
@@ -149,6 +144,22 @@ Place your GenericAgent directory alongside the codeg project. Codeg will auto-d
 <img src="assets/demo/codeg-demo.gif" width="90%" alt="Codeg Demo">
 </td>
 </tr></table>
+
+---
+
+## 💬 Bot Interface (IM)
+
+### Telegram Bot
+
+```python
+# mykey.py
+tg_bot_token = 'YOUR_BOT_TOKEN'
+tg_allowed_users = [YOUR_USER_ID]
+```
+
+```bash
+python frontends/tgapp.py
+```
 
 ### Common Chat Commands
 
@@ -313,8 +324,9 @@ MIT License — see [LICENSE](LICENSE)
 git clone https://github.com/lsdefine/GenericAgent.git
 cd GenericAgent
 
-# 2. 安装最小依赖
-pip install requests streamlit pywebview
+# 2. 安装依赖
+pip install requests streamlit pywebview   # 桌面 GUI (launch.pyw)
+pip install requests textual               # 终端 UI (tuiapp.py)
 
 # 3. 配置 API Key
 cp mykey_template.py mykey.py
@@ -346,7 +358,43 @@ python launch.pyw
 
 ---
 
-## 🤖 Bot 接口（可选）
+## 🖥️ 桌面前端
+
+### 终端 UI
+
+基于 [Textual](https://github.com/Textualize/textual) 的轻量键盘驱动界面。支持多会话并发、实时流式输出，有终端就能跑，无需浏览器。
+
+```bash
+python frontends/tuiapp.py
+```
+
+### 其他桌面前端
+
+```bash
+python frontends/qtapp.py                # 基于 Qt 的桌面应用
+streamlit run frontends/stapp2.py        # 另一种 Streamlit 风格 UI
+```
+
+### Codeg前端
+
+<table><tr>
+<td width="70%">
+
+[Codeg](https://github.com/yiqi-017/codeg)（`feat/genericagent-integration` 分支）是一个桌面/Web UI，可以将 GenericAgent 与其他代理（Claude Code、Gemini、Codex 等）在统一界面中并行使用，UI 更加精美。
+
+> 此集成已可使用，部分功能仍在完善中，欢迎体验反馈。
+
+将 GenericAgent 目录放在 codeg 项目同级目录下，Codeg 会自动检测 `frontends/genericagent_acp_bridge.py` 并将 GenericAgent 作为本地 ACP 代理启动。
+
+</td>
+<td width="30%">
+<img src="assets/demo/codeg-demo.gif" width="90%" alt="Codeg Demo">
+</td>
+</tr></table>
+
+---
+
+## 💬 Bot 接口（IM）
 
 ### 微信 Bot（个人微信）
 
@@ -427,32 +475,6 @@ dingtalk_client_id = "your_app_key"
 dingtalk_client_secret = "your_app_secret"
 dingtalk_allowed_users = ["your_staff_id"]  # 或 ['*']
 ```
-
-### 其他 App 前端
-
-除默认的 Streamlit Web UI 外，还可以尝试不同风格的前端：
-
-```bash
-python frontends/qtapp.py                # 基于 Qt 的桌面应用
-streamlit run frontends/stapp2.py        # 另一种 Streamlit 风格 UI
-```
-
-### Codeg前端
-
-<table><tr>
-<td width="70%">
-
-[Codeg](https://github.com/yiqi-017/codeg)（`feat/genericagent-integration` 分支）是一个桌面/Web UI，可以将 GenericAgent 与其他代理（Claude Code、Gemini、Codex 等）在统一界面中并行使用，UI 更加精美。
-
-> 此集成已可使用，部分功能仍在完善中，欢迎体验反馈。
-
-将 GenericAgent 目录放在 codeg 项目同级目录下，Codeg 会自动检测 `frontends/genericagent_acp_bridge.py` 并将 GenericAgent 作为本地 ACP 代理启动。
-
-</td>
-<td width="30%">
-<img src="assets/demo/codeg-demo.gif" width="90%" alt="Codeg Demo">
-</td>
-</tr></table>
 
 ### 通用聊天命令
 
