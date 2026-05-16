@@ -50,6 +50,22 @@ _ANSI_CONTROL_RE = re.compile(
     r"|\x1b[=>]"
 )
 
+# Strip the leading `**LLM Running (Turn N) ...**` marker that agent_loop yields per turn.
+# fold_turns still needs the marker in source content to split turns, so we only strip at
+# render time. Applies to the live (last) text segment, since folded turns don't include it.
+_TURN_MARKER_RE = re.compile(r"^\s*\**LLM Running \(Turn \d+\) \.\.\.\**\s*", re.MULTILINE)
+
+
+def _extract_user_text(entry: dict) -> str:
+    c = entry.get("content") if isinstance(entry, dict) else None
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts = [b.get("text", "") for b in c
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        return "\n".join(p for p in parts if p)
+    return ""
+
 
 def fold_turns(text: str) -> list[dict]:
     placeholders: list[str] = []
@@ -145,6 +161,12 @@ class ChatMessage:
     _body_widget: Any = field(default=None, repr=False)
     _cached_body: Any = field(default=None, repr=False)
     _cache_key: tuple = field(default=(), repr=False)
+    # Fold indices the user has manually toggled away from the global default.
+    # Effective expansion = (default ⊕ in this set), where default = not fold_mode.
+    _toggled_folds: set = field(default_factory=set, repr=False)
+    _segment_widgets: list = field(default_factory=list, repr=False)
+    _segment_sig: tuple = field(default=(), repr=False)
+    _spinner_widget: Any = field(default=None, repr=False)
 
 
 @dataclass
@@ -232,6 +254,14 @@ class SelectableStatic(Static):
             return None
         return selection.extract("\n".join(lines)), "\n"
 
+
+class FoldHeader(SelectableStatic):
+    # Clickable collapsed/expanded turn header. App.on_click reads .msg/.fold_idx
+    # to toggle msg._toggled_folds and remount the segments around this widget.
+    def __init__(self, body, msg, fold_idx, **kwargs):
+        super().__init__(body, **kwargs)
+        self.msg = msg
+        self.fold_idx = fold_idx
 
 
 def _read_clipboard_text() -> str:
@@ -562,12 +592,14 @@ def render_topbar(session_name: str, status: str, model: str, tasks_running: int
     return t
 
 
-def render_bottombar(quit_armed: bool = False) -> Table:
+def render_bottombar(quit_armed: bool = False, rewind_armed: bool = False) -> Table:
     t = Table.grid(expand=True)
     t.add_column(justify="left")
     left = Text()
     if quit_armed:
         left.append("再按 Ctrl+C 退出", style=f"bold {C_GREEN}")
+    elif rewind_armed:
+        left.append("再按 Esc 回退", style=f"bold {C_GREEN}")
     else:
         pairs = [("Enter", "发送"), ("Ctrl+N", "新会话"),
                  ("Ctrl+B", "侧栏"), ("Ctrl+C", "停止/退出"),
@@ -749,7 +781,14 @@ class GenericAgentTUI(App[None]):
     #messages {
         height: 1fr;
         background: #0d1117;
-        scrollbar-size: 0 0;
+        /* horizontal hidden, 1-col vertical bar on right. */
+        scrollbar-size: 0 1;
+        scrollbar-background: #0d1117;
+        scrollbar-background-hover: #0d1117;
+        scrollbar-background-active: #0d1117;
+        scrollbar-color: #30363d;
+        scrollbar-color-hover: #484f58;
+        scrollbar-color-active: #6e7681;
     }
 
     .role {
@@ -761,6 +800,8 @@ class GenericAgentTUI(App[None]):
         height: auto;
         margin-bottom: 0;
     }
+    .fold-header:hover { background: #161b22; }
+    .spinner { height: 1; }
 
     #palette {
         height: auto;
@@ -803,6 +844,9 @@ class GenericAgentTUI(App[None]):
         height: 3;
         min-height: 3;
         max-height: 5;
+        /* min-width guards TextArea.render_lines against `range() arg 3 must not be zero`
+           when the content region collapses to ≤ 0 cols (narrow window + sidebar shown). */
+        min-width: 10;
         background: #161b22;
         border: none;
         margin-bottom: 1;
@@ -846,6 +890,10 @@ class GenericAgentTUI(App[None]):
         self._resize_timer = None
         self._quit_armed: bool = False
         self._quit_timer = None
+        self._rewind_armed: bool = False
+        self._rewind_timer = None
+        self._spinner_frame: int = 0
+        self._spinner_timer = None
         self._handlers: dict = {
             "help": self._cmd_help, "status": self._cmd_status, "sessions": self._cmd_status,
             "new": self._cmd_new, "switch": self._cmd_switch, "close": self._cmd_close,
@@ -1050,20 +1098,48 @@ class GenericAgentTUI(App[None]):
         try: self._refresh_bottombar()
         except Exception: pass
 
+    def _disarm_rewind(self) -> None:
+        if not self._rewind_armed and self._rewind_timer is None:
+            return
+        self._rewind_armed = False
+        if self._rewind_timer is not None:
+            try: self._rewind_timer.stop()
+            except Exception: pass
+            self._rewind_timer = None
+        try: self._refresh_bottombar()
+        except Exception: pass
+
     def on_key(self, event: events.Key) -> None:
-        # Any key other than the quit trigger (Ctrl+C or its Cmd+C alias) disarms.
         if self._quit_armed and event.key not in ("ctrl+c", "cmd+c"):
             self._disarm_quit()
+        if self._rewind_armed and event.key != "escape":
+            self._disarm_rewind()
 
     def action_toggle_sidebar(self) -> None:
-        self.query_one("#sidebar", Static).toggle_class("-hidden")
-
-    def action_toggle_fold(self) -> None:
-        self.fold_mode = not self.fold_mode
-        # Invalidate assistant caches: fold state changes the rendered length.
+        # display:none/block reflow doesn't always settle within one refresh, so
+        # mirror the resize debounce: invalidate width-keyed caches, then remount
+        # via a short timer (call_after_refresh alone races the layout and the
+        # remount can capture the old content_region.width — leaving messages
+        # wrapped at the previous width after Ctrl+B).
+        sidebar = self.query_one("#sidebar", Static)
+        sidebar.toggle_class("-hidden")
         for sess in self.sessions.values():
             for m in sess.messages:
                 if m.role == "assistant":
+                    m._cached_body = None
+                    m._cache_key = ()
+        if self._resize_timer is not None:
+            self._resize_timer.stop()
+        self._resize_timer = self.set_timer(0.05, self._flush_resize)
+
+    def action_toggle_fold(self) -> None:
+        self.fold_mode = not self.fold_mode
+        # Global toggle is authoritative: clear per-fold overrides so the new state
+        # is uniformly all-collapsed or all-expanded.
+        for sess in self.sessions.values():
+            for m in sess.messages:
+                if m.role == "assistant":
+                    m._toggled_folds.clear()
                     m._cached_body = None
                     m._cache_key = ()
         self._remount_current_session()
@@ -1071,10 +1147,10 @@ class GenericAgentTUI(App[None]):
         self.notify(f"Fold: {'on' if self.fold_mode else 'off'}", timeout=1)
 
     def action_escape(self) -> None:
-        # Priority chain: pending choice → visible palette → disarm quit.
         choice = self._active_choice()
         if choice is not None:
             self._cancel_choice(choice.msg)
+            self._disarm_rewind()
             return
         try:
             palette = self.query_one("#palette", OptionList)
@@ -1083,8 +1159,21 @@ class GenericAgentTUI(App[None]):
         if palette is not None and palette.has_class("-visible"):
             self._hide_palette()
             self.query_one("#input", InputArea).focus()
+            self._disarm_rewind()
             return
-        self._disarm_quit()
+        if self._quit_armed:
+            self._disarm_quit()
+            return
+        if self._rewind_armed:
+            self._disarm_rewind()
+            self._cmd_rewind([], "")
+            return
+        self._rewind_armed = True
+        self._refresh_bottombar()
+        if self._rewind_timer is not None:
+            try: self._rewind_timer.stop()
+            except Exception: pass
+        self._rewind_timer = self.set_timer(2.0, self._disarm_rewind)
 
     def action_show_help(self) -> None:
         if isinstance(self.screen, HelpScreen):
@@ -1107,6 +1196,7 @@ class GenericAgentTUI(App[None]):
             ("/",                       "唤起命令面板"),
             ("Tab",                     "命令面板可见时补全"),
             ("Esc",                     "取消选择 / 关闭面板 / 关闭帮助"),
+            ("Esc Esc",                 "打开回退选择"),
             ("Ctrl+/",                  "显示 / 隐藏本帮助"),
         ]
         t = Text()
@@ -1130,6 +1220,18 @@ class GenericAgentTUI(App[None]):
             palette.action_select()
 
     def on_click(self, event: events.Click) -> None:
+        w = event.widget
+        if isinstance(w, FoldHeader):
+            msg = w.msg
+            idx = w.fold_idx
+            if idx in msg._toggled_folds:
+                msg._toggled_folds.discard(idx)
+            else:
+                msg._toggled_folds.add(idx)
+            msg._cached_body = None
+            msg._cache_key = ()
+            self._remount_assistant_message(msg)
+            return
         try:
             sidebar = self.query_one("#sidebar", Static)
         except Exception:
@@ -1199,6 +1301,9 @@ class GenericAgentTUI(App[None]):
             m._role_widget = None
             m._body_widget = None
             m._hint_widget = None
+            m._segment_widgets = []
+            m._segment_sig = ()
+            m._spinner_widget = None
         for m in self.current.messages:
             self._mount_message(container, m)
         container.scroll_end(animate=False)
@@ -1334,6 +1439,7 @@ class GenericAgentTUI(App[None]):
         msg.selected_label = display
         msg.content = display
         container = self.query_one("#messages", VerticalScroll)
+        was_at_bottom = self._at_bottom(container)
         body = Text()
         body.append("✓ ", style=C_GREEN)
         body.append(display, style=C_FG)
@@ -1349,6 +1455,8 @@ class GenericAgentTUI(App[None]):
         if msg._body_widget is not None:
             msg._body_widget.remove()
         msg._body_widget = new_widget
+        if was_at_bottom:
+            container.scroll_end(animate=False)
         self.query_one("#input", InputArea).focus()
 
     def _dispatch_command(self, cmd: str, args: list[str], raw: str = "") -> None:
@@ -1412,6 +1520,10 @@ class GenericAgentTUI(App[None]):
             nm._hint_widget = None
             nm._cached_body = None
             nm._cache_key = ()
+            nm._segment_widgets = []
+            nm._segment_sig = ()
+            nm._toggled_folds = set()
+            nm._spinner_widget = None
             new.messages.append(nm)
         new.task_seq = old.task_seq
         n = len(new.agent.llmclient.backend.history)
@@ -1421,8 +1533,35 @@ class GenericAgentTUI(App[None]):
         sess = self.current
         if sess.status == "running":
             self._system("Cannot rewind while running. /stop first."); return
-        history = sess.agent.llmclient.backend.history
-        turns = []
+        turns = self._rewindable_turns()
+        if not turns:
+            self._system("No rewindable turns."); return
+        if args:
+            try: n = int(args[0])
+            except ValueError: self._system("Usage: /rewind <n>"); return
+            if n < 1 or n > len(turns):
+                self._system(f"Invalid: 1-{len(turns)}"); return
+            self._system(self._do_rewind(n))
+            return
+        LIMIT = 20
+        recent = list(reversed(turns))[:LIMIT]
+        choices = []
+        for offset, (_, prev) in enumerate(recent, 1):
+            preview = (prev or "（空）").replace("\n", " ").strip()[:60]
+            choices.append((f"回退 {offset} 轮 · {preview}", offset))
+        head = "选择回退到的轮次 (↑/↓ 移动，→/Enter 确认，Esc 取消)"
+        if len(turns) > LIMIT:
+            head += f"  [仅显示最近 {LIMIT}/{len(turns)}]"
+        msg = ChatMessage(
+            role="system", content=head, kind="choice", choices=choices,
+            on_select=lambda v: self._do_rewind(v),
+        )
+        sess.messages.append(msg)
+        self._refresh_messages()
+
+    def _rewindable_turns(self) -> list[tuple[int, str]]:
+        history = self.current.agent.llmclient.backend.history
+        turns: list[tuple[int, str]] = []
         for i, m in enumerate(history):
             if m.get("role") != "user": continue
             c = m.get("content")
@@ -1434,22 +1573,19 @@ class GenericAgentTUI(App[None]):
                 texts = [b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"]
                 if texts and any(t.strip() for t in texts):
                     turns.append((i, texts[0][:60]))
-        if not turns:
-            self._system("No rewindable turns."); return
-        if not args:
-            lines = [f"Rewindable turns ({len(turns)}):"]
-            for offset, (_, prev) in enumerate(reversed(turns[-10:]), 1):
-                lines.append(f"  {offset}) {prev!r}")
-            lines.append("/rewind <n> to undo n turns")
-            self._system("\n".join(lines)); return
-        try: n = int(args[0])
-        except ValueError: self._system("Usage: /rewind <n>"); return
-        if n < 1 or n > len(turns):
-            self._system(f"Invalid: 1-{len(turns)}"); return
+        return turns
+
+    def _do_rewind(self, n: int) -> str:
+        sess = self.current
+        turns = self._rewindable_turns()
+        if not (1 <= n <= len(turns)):
+            return f"❌ 回退失败：n 应在 1-{len(turns)}"
+        history = sess.agent.llmclient.backend.history
         cut = turns[-n][0]
+        prefill = _extract_user_text(history[cut]) if cut < len(history) else ""
         removed = len(history) - cut
         history[:] = history[:cut]
-        real_user = [i for i, m in enumerate(sess.messages) if m.role == "user"]
+        real_user = [i for i, msg in enumerate(sess.messages) if msg.role == "user"]
         if n <= len(real_user):
             sess.messages = sess.messages[:real_user[-n]]
         try: sess.agent.history.append(f"[USER]: /rewind {n}")
@@ -1457,7 +1593,15 @@ class GenericAgentTUI(App[None]):
         self._remount_current_session()
         self._refresh_topbar()
         self._refresh_sidebar()
-        self._system(f"Rewound {n} turn(s). Removed {removed} entries.")
+        if prefill:
+            try:
+                inp = self.query_one("#input", InputArea)
+                inp.text = prefill
+                inp.move_cursor((inp.document.line_count - 1, len(prefill.split("\n")[-1])))
+                inp.focus()
+                self._resize_input(inp)
+            except Exception: pass
+        return f"已回退 {n} 轮（移除 {removed} 条历史）"
 
     def _cmd_clear(self, args, raw):
         self.current.messages.clear()
@@ -1747,11 +1891,11 @@ class GenericAgentTUI(App[None]):
                 break
         if agent_id != self.current_id:
             return
-        if found and found._body_widget is not None:
+        if found and found._segment_widgets:
             try:
                 container = self.query_one("#messages", VerticalScroll)
                 was_at_bottom = self._at_bottom(container)
-                found._body_widget.update(self._build_assistant_body(found))
+                self._stream_update_assistant(found)
                 if was_at_bottom:
                     container.scroll_end(animate=False)
             except Exception:
@@ -1761,6 +1905,7 @@ class GenericAgentTUI(App[None]):
         if refresh_chrome:
             self._refresh_sidebar()
             self._refresh_topbar()
+        self._ensure_spinner()
 
     # ---------------- UI refresh ----------------
     def _system(self, text: str) -> None:
@@ -1774,6 +1919,7 @@ class GenericAgentTUI(App[None]):
         self._refresh_topbar()
         self._refresh_sidebar()
         self._refresh_messages()
+        self._ensure_spinner()
 
     def _swap_input_for_session(self) -> None:
         """Persist the InputArea's text/history/pastes per-session so switching
@@ -1818,7 +1964,10 @@ class GenericAgentTUI(App[None]):
     def _refresh_bottombar(self):
         if not self.is_mounted: return
         try:
-            self.query_one("#bottombar", Static).update(render_bottombar(quit_armed=self._quit_armed))
+            self.query_one("#bottombar", Static).update(render_bottombar(
+                quit_armed=self._quit_armed,
+                rewind_armed=self._rewind_armed,
+            ))
         except Exception:
             pass
 
@@ -1843,6 +1992,9 @@ class GenericAgentTUI(App[None]):
             for m in sess.messages:
                 m._role_widget = None
                 m._body_widget = None
+                m._segment_widgets = []
+                m._segment_sig = ()
+                m._spinner_widget = None
             self._last_session_id = sess.agent_id
         for m in sess.messages:
             if m._role_widget is None:
@@ -1857,35 +2009,97 @@ class GenericAgentTUI(App[None]):
         except Exception:
             return 100
 
-    def _build_assistant_body(self, m: ChatMessage):
+    def _render_md(self, text: str, width: int):
         # Markdown via RichVisual loses segment.style.meta["offset"] so mouse selection
         # can't anchor; round-trip through ANSI → Text.from_ansi to restore selectability.
-        width = self._messages_width()
-        key = (len(m.content or ""), m.done, width, self.fold_mode)
-        if m._cache_key == key and m._cached_body is not None:
-            return m._cached_body
-        suffix = "" if m.done else " …"
-        raw = m.content or ""
-        cleaned = _ANSI_CONTROL_RE.sub("", raw)
-        if self.fold_mode:
-            cleaned = render_folded_text(cleaned)
-        text = cleaned + suffix
-        if not raw.strip():
-            return Text(suffix or "（空）", style=C_DIM)
         try:
             from io import StringIO
             from rich.console import Console
+            # Render one column narrower so Rich horizontal rules don't wrap.
+            render_w = max(1, width - 1)
             buf = StringIO()
-            Console(file=buf, width=width, force_terminal=True,
+            Console(file=buf, width=render_w, force_terminal=True,
                     color_system="truecolor", legacy_windows=False
                     ).print(HardBreakMarkdown(text), end="")
-            body = Text.from_ansi(buf.getvalue().rstrip("\n"))
+            return Text.from_ansi(buf.getvalue().rstrip("\n"))
         except Exception:
-            body = Text(text, style=C_FG)
-        if m.done:  # streaming content keeps changing — only cache final
-            m._cached_body = body
+            return Text(text, style=C_FG)
+
+    def _assistant_segments(self, m: ChatMessage, width: int) -> list[tuple]:
+        """Return [(kind, body, fold_idx_or_None)]. kind ∈ {'text','fold-header','fold-body'}.
+        fold_idx is the position in fold_turns() output — stable across streaming since
+        new turns only append. Last segment carries the streaming suffix."""
+        raw = m.content or ""
+        # Cache final renders — Markdown re-parse on every resize is expensive over long history.
+        key = (len(raw), m.done, width, self.fold_mode, frozenset(m._toggled_folds))
+        if m.done and m._cache_key == key and m._cached_body is not None:
+            return m._cached_body
+        # No streaming suffix here — spinner lives in m._spinner_widget so Markdown
+        # rendering (unclosed code fences, paragraph whitespace stripping) can't eat it.
+        if not raw.strip():
+            return [("text", Text("（空）" if m.done else " ", style=C_DIM), None)]
+        cleaned = _ANSI_CONTROL_RE.sub("", raw)
+        raw_segs = fold_turns(cleaned)
+        out: list[tuple] = []
+        last_i = len(raw_segs) - 1
+        for i, seg in enumerate(raw_segs):
+            if seg["type"] == "fold":
+                # fold_mode=True → default collapsed; False → default expanded. Per-fold
+                # clicks flip the default for that fold via the toggle set.
+                expanded = (not self.fold_mode) ^ (i in m._toggled_folds)
+                arrow = "▾" if expanded else "▸"
+                title = seg.get("title") or "completed turn"
+                header = Text(); header.append(f"{arrow} ", style=C_DIM); header.append(title, style=C_MUTED)
+                out.append(("fold-header", header, i))
+                if expanded:
+                    out.append(("fold-body", self._render_md(seg.get("content", ""), width), i))
+            else:
+                content = _TURN_MARKER_RE.sub("", seg.get("content", ""), count=1)
+                out.append(("text", self._render_md(content, width), None))
+        if m.done:
+            m._cached_body = out
             m._cache_key = key
-        return body
+        return out
+
+    _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def _spinner_glyph(self) -> str:
+        return self._SPINNER_FRAMES[self._spinner_frame % len(self._SPINNER_FRAMES)]
+
+    def _has_streaming(self) -> bool:
+        if self.current_id is None:
+            return False
+        return any(m.role == "assistant" and not m.done for m in self.current.messages)
+
+    def _ensure_spinner(self) -> None:
+        # Independent timer keeps frames advancing between chunks (chunks may stall on the
+        # network). Self-stops once no assistant message in the current session is streaming.
+        running = self._has_streaming()
+        if running and self._spinner_timer is None:
+            self._spinner_timer = self.set_interval(0.1, self._spinner_tick)
+        elif not running and self._spinner_timer is not None:
+            self._spinner_timer.stop()
+            self._spinner_timer = None
+            self._spinner_frame = 0
+
+    def _spinner_tick(self) -> None:
+        self._spinner_frame = (self._spinner_frame + 1) % len(self._SPINNER_FRAMES)
+        if self.current_id is None:
+            self._ensure_spinner(); return
+        glyph = Text(self._spinner_glyph(), style=C_DIM)
+        for m in self.current.messages:
+            if m.role == "assistant" and not m.done and m._spinner_widget is not None:
+                try: m._spinner_widget.update(glyph)
+                except Exception: pass
+        if not self._has_streaming():
+            self._ensure_spinner()
+
+    @staticmethod
+    def _segment_sig(segs: list[tuple]) -> tuple:
+        # Topology fingerprint: ignores body content so streaming chunks within the same
+        # last text segment don't invalidate the structure. Used to decide stream-update
+        # (in-place .update of last widget) vs. full remount (when folds appear/expand).
+        return tuple((kind, idx) for kind, _, idx in segs)
 
     _ROLE_COLOR = {"user": C_PURPLE, "system": C_BLUE, "assistant": C_GREEN}
 
@@ -1908,16 +2122,117 @@ class GenericAgentTUI(App[None]):
 
         if m.kind == "choice":  # selected_label is not None
             body = Text(); body.append("✓ ", style=C_GREEN); body.append(m.selected_label, style=C_FG)
-        elif m.role == "user":
+            m._body_widget = SelectableStatic(body, classes="msg")
+            container.mount(m._body_widget)
+            return
+        if m.role == "user":
             body = Text(); body.append("> ", style=C_DIM); body.append(m.content, style=C_FG)
             for path in m.image_paths:
                 body.append(f"\n📎 {path}", style=C_MUTED)
-        elif m.role == "system":
-            body = Text(m.content, style=C_MUTED)
-        else:
-            body = self._build_assistant_body(m)
-        m._body_widget = SelectableStatic(body, classes="msg")
-        container.mount(m._body_widget)
+            m._body_widget = SelectableStatic(body, classes="msg")
+            container.mount(m._body_widget)
+            return
+        if m.role == "system":
+            m._body_widget = SelectableStatic(Text(m.content, style=C_MUTED), classes="msg")
+            container.mount(m._body_widget)
+            return
+        # assistant — multi-segment for per-fold click-to-expand
+        segs = self._assistant_segments(m, self._messages_width())
+        self._mount_assistant_segments(container, m, segs)
+
+    def _mount_assistant_segments(self, container, m: ChatMessage, segs: list[tuple],
+                                  after=None) -> None:
+        m._segment_widgets = []
+        last_text = None
+        anchor = after
+        for kind, body, fold_idx in segs:
+            if kind == "fold-header":
+                w = FoldHeader(body, m, fold_idx, classes="msg fold-header")
+            else:
+                w = SelectableStatic(body, classes="msg")
+            if anchor is None:
+                container.mount(w)
+            else:
+                container.mount(w, after=anchor)
+                anchor = w
+            m._segment_widgets.append(w)
+            if kind == "text":
+                last_text = w
+        m._body_widget = last_text  # keeps existing streaming `.update()` paths working
+        m._segment_sig = self._segment_sig(segs)
+        self._sync_spinner_widget(container, m, anchor)
+
+    def _sync_spinner_widget(self, container, m: ChatMessage, anchor) -> None:
+        """Spinner is a tiny dedicated Static after segment widgets — outside Markdown
+        so unclosed code fences / paragraph trimming can't eat it. Mounted iff streaming."""
+        if m.done:
+            if m._spinner_widget is not None:
+                try: m._spinner_widget.remove()
+                except Exception: pass
+                m._spinner_widget = None
+            return
+        if m._spinner_widget is None:
+            w = Static(Text(self._spinner_glyph(), style=C_DIM), classes="msg spinner")
+            if anchor is None:
+                container.mount(w)
+            else:
+                container.mount(w, after=anchor)
+            m._spinner_widget = w
+
+    def _stream_update_assistant(self, m: ChatMessage) -> None:
+        """Cheap path for per-chunk streaming: if the fold topology is unchanged, only
+        the last text segment got new content, so render and update that one widget.
+        Otherwise (a new Turn marker appeared), do a full remount."""
+        new_sig = self._assistant_sig_only(m)
+        if (new_sig == m._segment_sig and m._segment_widgets
+                and new_sig and new_sig[-1][0] == "text"):
+            width = self._messages_width()
+            raw = m.content or ""
+            cleaned = _ANSI_CONTROL_RE.sub("", raw)
+            last_seg = fold_turns(cleaned)[-1]
+            last_text = _TURN_MARKER_RE.sub("", last_seg.get("content", ""), count=1)
+            m._segment_widgets[-1].update(self._render_md(last_text, width))
+            if m.done and m._spinner_widget is not None:
+                try: m._spinner_widget.remove()
+                except Exception: pass
+                m._spinner_widget = None
+            return
+        self._remount_assistant_message(m)
+
+    def _assistant_sig_only(self, m: ChatMessage) -> tuple:
+        # Topology signature without rendering bodies — used by the streaming fast path.
+        raw = m.content or ""
+        if not raw.strip():
+            return (("text", None),)
+        cleaned = _ANSI_CONTROL_RE.sub("", raw)
+        sig = []
+        for i, seg in enumerate(fold_turns(cleaned)):
+            if seg["type"] == "fold":
+                sig.append(("fold-header", i))
+                if (not self.fold_mode) ^ (i in m._toggled_folds):
+                    sig.append(("fold-body", i))
+            else:
+                sig.append(("text", None))
+        return tuple(sig)
+
+    def _remount_assistant_message(self, m: ChatMessage) -> None:
+        """Rebuild just this message's segments in-place. Used by click-to-expand and
+        by streaming when fold topology changes."""
+        try:
+            container = self.query_one("#messages", VerticalScroll)
+        except Exception:
+            return
+        anchor = m._role_widget
+        for w in m._segment_widgets:
+            try: w.remove()
+            except Exception: pass
+        m._segment_widgets = []
+        if m._spinner_widget is not None:
+            try: m._spinner_widget.remove()
+            except Exception: pass
+            m._spinner_widget = None
+        segs = self._assistant_segments(m, self._messages_width())
+        self._mount_assistant_segments(container, m, segs, after=anchor)
 
 
 # ---------- CLI ----------
